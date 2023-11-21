@@ -11,7 +11,7 @@ require (
 	github.com/pion/logging v0.2.2
 	github.com/pion/randutil v0.1.0
 	github.com/pion/transport/v3 v3.0.1
-	github.com/pion/turn/v3 v3.0.1
+	github.com/pion/turn/v3 v3.0.2-0.20230918061441-f15249d8bdae
 	github.com/prometheus/client_golang v1.16.0
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.8.4
