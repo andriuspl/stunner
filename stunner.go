@@ -4,7 +4,6 @@ package stunner
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/pion/logging"
@@ -15,23 +14,22 @@ import (
 	"github.com/l7mp/stunner/internal/object"
 	"github.com/l7mp/stunner/internal/resolver"
 	"github.com/l7mp/stunner/internal/telemetry"
-	"github.com/l7mp/stunner/pkg/apis/v1alpha1"
+	stnrv1 "github.com/l7mp/stunner/pkg/apis/v1"
 	"github.com/l7mp/stunner/pkg/logger"
 )
 
 const DefaultLogLevel = "all:WARN"
 
-var DefaultInstanceId = fmt.Sprintf("stunnerd-%s", uuid.New().String())
+var DefaultInstanceId = fmt.Sprintf("default/stunnerd-%s", uuid.New().String())
 
 // Stunner is an instance of the STUNner deamon.
 type Stunner struct {
-	id                                                         string
-	version                                                    string
+	name, version                                              string
 	adminManager, authManager, listenerManager, clusterManager manager.Manager
 	suppressRollback, dryRun                                   bool
 	resolver                                                   resolver.DnsResolver
 	udpThreadNum                                               int
-	logger                                                     *logger.LoggerFactory
+	logger                                                     *logger.LeveledLoggerFactory
 	log                                                        logging.LeveledLogger
 	net                                                        transport.Net
 	ready, shutdown                                            bool
@@ -73,18 +71,18 @@ func NewStunner(options Options) *Stunner {
 		udpThreadNum = options.UDPListenerThreadNum
 	}
 
-	id := options.Id
+	id := options.Name
 	if id == "" {
 		if h, err := os.Hostname(); err != nil {
 			id = DefaultInstanceId
 		} else {
-			id = h
+			id = fmt.Sprintf("default/stunnerd-%s", h)
 		}
 	}
 
 	s := &Stunner{
-		id:               id,
-		version:          v1alpha1.ApiVersion,
+		name:             id,
+		version:          stnrv1.ApiVersion,
 		logger:           logger,
 		log:              log,
 		suppressRollback: options.SuppressRollback,
@@ -95,7 +93,7 @@ func NewStunner(options Options) *Stunner {
 	}
 
 	s.adminManager = manager.NewManager("admin-manager",
-		object.NewAdminFactory(options.DryRun, s.NewReadinessHandler(), logger), logger)
+		object.NewAdminFactory(options.DryRun, s.NewReadinessHandler(), s.NewStatusHandler(), logger), logger)
 	s.authManager = manager.NewManager("auth-manager",
 		object.NewAuthFactory(logger), logger)
 	s.listenerManager = manager.NewManager("listener-manager",
@@ -106,7 +104,7 @@ func NewStunner(options Options) *Stunner {
 	if !s.dryRun {
 		s.resolver.Start()
 		telemetry.Init()
-		// telemetry.RegisterMetrics(s.log, func() float64 { return s.GetActiveConnections() })
+		telemetry.RegisterAllocationMetric(s.log, s.GetActiveConnections)
 	}
 
 	// TODO: remove this when STUNner gains self-managed dataplanes
@@ -117,7 +115,7 @@ func NewStunner(options Options) *Stunner {
 
 // GetId returns the id of the current stunnerd instance.
 func (s *Stunner) GetId() string {
-	return s.id
+	return s.name
 }
 
 // GetVersion returns the STUNner API version.
@@ -139,7 +137,7 @@ func (s *Stunner) Shutdown() {
 
 // GetAdmin returns the admin object underlying STUNner.
 func (s *Stunner) GetAdmin() *object.Admin {
-	a, found := s.adminManager.Get(v1alpha1.DefaultAdminName)
+	a, found := s.adminManager.Get(stnrv1.DefaultAdminName)
 	if !found {
 		panic("internal error: no Admin found")
 	}
@@ -148,7 +146,7 @@ func (s *Stunner) GetAdmin() *object.Admin {
 
 // GetAuth returns the authenitation object underlying STUNner.
 func (s *Stunner) GetAuth() *object.Auth {
-	a, found := s.authManager.Get(v1alpha1.DefaultAuthName)
+	a, found := s.authManager.Get(stnrv1.DefaultAuthName)
 	if !found {
 		panic("internal error: no Auth found")
 	}
@@ -206,30 +204,43 @@ func (s *Stunner) AllocationCount() int {
 	return n
 }
 
-// Status returns a short status description of the running STUNner instance.
-func (s *Stunner) Status() string {
-	listeners := s.listenerManager.Keys()
-	ls := make([]string, len(listeners))
-	for i, l := range listeners {
-		ls[i] = s.GetListener(l).String()
+// Status returns the status for the running STUNner instance.
+func (s *Stunner) Status() stnrv1.Status {
+	status := stnrv1.StunnerStatus{ApiVersion: s.version}
+	if admin := s.GetAdmin(); admin != nil {
+		status.Admin = admin.Status().(*stnrv1.AdminStatus)
 	}
-	str := "NONE"
-	if len(ls) > 0 {
-		str = strings.Join(ls, ", ")
+	if auth := s.GetAuth(); auth != nil {
+		status.Auth = auth.Status().(*stnrv1.AuthStatus)
 	}
 
-	status := "READY"
+	ls := s.listenerManager.Keys()
+	status.Listeners = make([]*stnrv1.ListenerStatus, len(ls))
+	for i, lName := range ls {
+		if l := s.GetListener(lName); l != nil {
+			status.Listeners[i] = l.Status().(*stnrv1.ListenerStatus)
+		}
+	}
+
+	cs := s.clusterManager.Keys()
+	status.Clusters = make([]*stnrv1.ClusterStatus, len(cs))
+	for i, cName := range cs {
+		if c := s.GetCluster(cName); c != nil {
+			status.Clusters[i] = c.Status().(*stnrv1.ClusterStatus)
+		}
+	}
+
+	status.AllocationCount = s.AllocationCount()
+	stat := "READY"
 	if !s.ready {
-		status = "NOT-READY"
+		stat = "NOT-READY"
 	}
 	if s.shutdown {
-		status = "TERMINATING"
+		stat = "TERMINATING"
 	}
+	status.Status = stat
 
-	auth := s.GetAuth()
-	return fmt.Sprintf("status: %s, realm: %s, authentication: %s, listeners: %s"+
-		", active allocations: %d", status, auth.Realm, auth.Type.String(), str,
-		s.AllocationCount())
+	return &status
 }
 
 // Close stops the STUNner daemon, cleans up any internal state, and closes all connections
@@ -264,7 +275,7 @@ func (s *Stunner) Close() {
 		}
 	}
 
-	// telemetry.UnregisterMetrics(s.log)
+	telemetry.UnregisterAllocationMetric(s.log)
 	if !s.dryRun {
 		telemetry.Close()
 	}
@@ -273,4 +284,7 @@ func (s *Stunner) Close() {
 }
 
 // GetActiveConnections returns the number of active downstream (listener-side) TURN allocations.
-func (s *Stunner) GetActiveConnections() float64 { return 0.0 }
+func (s *Stunner) GetActiveConnections() float64 {
+	count := s.AllocationCount()
+	return float64(count)
+}

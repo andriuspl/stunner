@@ -55,14 +55,13 @@ PeerConnection, generates an SDP Offer and sends it back the application server 
 
 At this point the application server has both party's SDP Offer, so the next step is to set up the
 media pipeline in Kurento and process the SDP Offers through the media server. This is done by
-opening a WebSocket connection to the URI `ws://kms.default.svc.cluster.local:8888/kurento`
-(this is set on the server's command line in the Deployment
-[manifest](kurento-one2one-call-server.yaml)): here,
-`kms.default.svc.cluster.local` is the DNS name assigned by Kubernetes to the `kms` service
-(recall, this is the service associated with the media server Deployment) and Kurento listens on
-the TCP port 8888 for control connections. Note that this call gets load-balanced through the
-Kubernetes CNI's service load-balancer so it will hit one random media server replica (if there are
-more). This ensures that new calls are distributed evenly across media servers.
+opening a WebSocket connection to the URI `ws://kms.default.svc.cluster.local:8888/kurento` (this
+is set on the server's command line in the Deployment
+[manifest](kurento-one2one-call-server.yaml)): here, `kms.default.svc.cluster.local` is the DNS
+name assigned by Kubernetes to the `kms` service and Kurento listens on the TCP port 8888 for
+control connections. Note that this call gets load-balanced through the Kubernetes CNI's service
+load-balancer so it will hit one random media server replica (if there are more). This ensures that
+new calls are distributed evenly across media servers.
 
 The media server responds with an SDP Answer for both the callee and the caller, which the
 application server immediately sends back to the appropriate clients: the caller receives the SDP
@@ -79,13 +78,12 @@ documentation](https://doc-kurento.readthedocs.io/en/latest/tutorials/node/tutor
 
 In order to start the ICE conversation using STUNner as the STUN/TURN server, the browsers will
 need to learn an ICE server configuration from the application server with STUNner's external IP
-addresses/ports and the required STUN/TURN credentials. This must happen *before* the
-PeerConnection is created in the clients: once the PeerConnection is running we can no longer
-change the ICE configuration.
+addresses/ports and STUN/TURN credentials. This must happen *before* the PeerConnection is created
+in the clients: once the PeerConnection is running we can no longer change the ICE configuration.
 
 We solve this problem by (1) generating a new ICE configuration every time a new client registers
 with the application server and (2) sending the ICE configuration back to the client in the
-`regiterResponse` message. Note that this choice is suboptimal for time-locked STUNner
+`registerResponse` message. Note that this choice is suboptimal for time-locked STUNner
 authentication modes (i.e., the `ephemeral` mode, see below), because clients' STUN/TURN
 credentials might expire by the time they decide to connect. It is up to the application server
 developer to make sure that clients' ICE server configuration is periodically updated.
@@ -256,9 +254,9 @@ to modify *anything* in the demo and it will just work.
 
 ### STUNner configuration
 
-Next, we deploy STUNner into the Kubernetes. The manifest below will set up a minimal STUNner
-gateway hierarchy to do just that: the setup includes a Gateway listener at UDP:3478 and a
-UDPRoute to forward incoming calls into the cluster.
+Next, we deploy STUNner into Kubernetes. The manifest below will set up a minimal STUNner gateway
+hierarchy to do just that: the setup includes a Gateway listener at UDP:3478 and a UDPRoute to
+forward incoming calls into the cluster.
 
 ```console
 kubectl apply -f docs/examples/kurento-one2one-call/kurento-one2one-call-stunner.yaml
@@ -269,7 +267,7 @@ public TURN server on the UDP port 3478 through which clients will connect to th
 server pods.
 
 ```yaml
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: udp-gateway
@@ -279,25 +277,23 @@ spec:
   listeners:
     - name: udp-listener
       port: 3478
-      protocol: UDP
+      protocol: TURN-UDP
 ```
 
-In order to realize the media-plane deployment model we set the `kms` service, which wraps the
-Kurento media server deployment, as the target in the UDPRoute. Note that the target service lives
-in another namespace (the UDPRoute is in `stunner` whereas the `kms` service is in the `default`
-namespace), STUNner will still be able to forward connections (this is a small departure from the
-[Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) spec, which requires you to install a
-TargetRef into the target namespace; currently STUNner ignores this for simplicity). The rest, that
-is, cross-connecting the clients' media streams with Kurento's WebRTC endpoints, is just pure TURN
-magic.
+We set the `kms` service, which wraps the Kurento media server deployment, as the target in the
+UDPRoute. Note that the target service lives in another namespace (the UDPRoute is in `stunner`
+whereas the `kms` service is in the `default` namespace), STUNner will still be able to forward
+connections (this is a small departure from the [Kubernetes Gateway
+API](https://gateway-api.sigs.k8s.io) spec). The rest, that is, cross-connecting the clients' media
+streams with Kurento's WebRTC endpoints, is just pure TURN magic.
 
 Below is the corresponding UDPRoute.
 
 ```yaml
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: stunner.l7mp.io/v1
 kind: UDPRoute
 metadata:
-  name: stunner-headless
+  name: kms-media-plane
   namespace: stunner
 spec:
   parentRefs:
@@ -312,30 +308,29 @@ spec:
 
 Check whether you have all the necessary objects installed into the `stunner` namespace.
 ```console
-kubectl get gatewayconfigs,gateways,udproutes -n stunner
-NAME                                                  REALM             AUTH        AGE
-gatewayconfig.stunner.l7mp.io/stunner-gatewayconfig   stunner.l7mp.io   plaintext   95m
+kubectl get gatewayconfigs,gateways,udproutes.stunner.l7mp.io -n stunner
+NAME                                                  REALM             DATAPLANE   AGE
+gatewayconfig.stunner.l7mp.io/stunner-gatewayconfig   stunner.l7mp.io   default     84s
 
-NAME                                            CLASS                  ADDRESS   READY   AGE
-gateway.gateway.networking.k8s.io/udp-gateway   stunner-gatewayclass             True    95m
+NAME                                            CLASS                  ADDRESS          PROGRAMMED   AGE
+gateway.gateway.networking.k8s.io/udp-gateway   stunner-gatewayclass   34.118.112.176   True         84s
 
-NAME                                                 AGE
-udproute.gateway.networking.k8s.io/kms-media-plane   95m
+NAME                                       AGE
+udproute.stunner.l7mp.io/kms-media-plane   84s
 ```
 
-You can also use the handy `stunnerctl` CLI tool to dump the running STUNner configuration.
+You can also use the handy CLI tool called [`stunnerctl`](/cmd/stunnerctl/README.md) to dump the running STUNner configuration.
 
 ```console
-cmd/stunnerctl/stunnerctl running-config stunner/stunnerd-config
-STUN/TURN authentication type:  plaintext
-STUN/TURN username:             user-1
-STUN/TURN password:             pass-1
-Listener 1
-        Name:   udp-listener
-        Listener:       udp-listener
-        Protocol:       UDP
-        Public address: 34.118.18.210
-        Public port:    3478
+stunnerctl -n stunner config udp-gateway
+Gateway: stunner/udp-gateway (loglevel: "all:INFO")
+Authentication type: static, username/password: user-1/pass-1
+Listeners:
+  - Name: stunner/udp-gateway/udp-listener
+    Protocol: TURN-UDP
+    Public address:port: 34.118.112.176:3478
+    Routes: [stunner/kms-media-plane]
+    Endpoints: [10.76.1.4, 10.80.4.47]
 ```
 
 ### Run the test
@@ -366,14 +361,18 @@ with STUNner.
 
   ```js
   {
-    "iceServers": [
-      {
-        "url": "turn:34.118.18.210:3478?transport=UDP",
-        "username": "user-1",
-        "credential": "pass-1"
-      }
-    ],
-    "iceTransportPolicy": "relay"
+    "id": "registerResponse",
+    "response": "accepted",
+    "iceConfiguration": {
+      "iceServers": [
+        {
+          "urls": ["turn:34.118.112.176:3478?transport=udp"],
+          "username": "user-1",
+          "credential": "pass-1"
+        }
+      ],
+      "iceTransportPolicy": "relay"
+    }
   }
   ```
 
@@ -386,10 +385,10 @@ with STUNner.
   in turn passes them over verbatim to Kurento.
 
   ```console
-  Sending message: {[...] "candidate:0 1 UDP 91889663 10.116.1.42 51510 typ relay raddr 10.116.1.42 rport 51510" [...]}
+  Sending message: {[...] "candidate:0 1 UDP 92020735 10.76.0.19 49944 typ relay raddr 10.76.0.19 rport 49944" [...]}
   ```
 
-  Observe that the ICE candidate contains a private IP address (`10.116.1.42` in this case) as the
+  Observe that the ICE candidate contains a private IP address (`10.76.0.19` in this case) as the
   TURN relay connection address: this just happens to be the IP address of the STUNner pod that
   receives the TURN allocation request from the browser.
 
@@ -398,11 +397,11 @@ with STUNner.
   clients as remote ICE candidates.
 
   ```console
-  Received message: {[...] "candidate:1 1 UDP 2015363327 10.116.2.44 17325 typ host" [...]}
+  Received message: {[...] "candidate:1 1 UDP 2015363327 10.76.0.17 13081 typ host" [...]}
   ```
 
-  Observe that the ICE candidate again contains a private IP: in fact, `10.116.2.44` is the pod IP
-  address belonging to the Kurento media server instance that received the call setup request from
+  Observe that the ICE candidate again contains a private IP: in fact, `10.76.0.17` is the pod IP
+  address that belongs to the Kurento media server pod that received the call setup request from
   the application server.
 
 - Once ICE candidates are exchanged, both clients have a set of local and remote ICE candidates
@@ -442,15 +441,13 @@ applications with STUNner.
 
 ## Update STUN/TURN credentials
 
-As exemplified by `stunnerctl` output, STUNner currently runs with fairly poor security: using
-`static` authentication (note that `static` is an alias to the legacy `plaintext` authentication
-type you see above), sharing a single username/password pair between all active sessions.
+As shown in the  `stunnerctl` output, STUNner currently runs with fairly poor security: using
+`static` authentication, sharing a single username/password pair between all active sessions.
 
 ``` console
-cmd/stunnerctl/stunnerctl running-config stunner/stunnerd-config
-STUN/TURN authentication type:  plaintext
-STUN/TURN username:             user-1
-STUN/TURN password:             pass-1
+stunnerctl -n stunner config udp-gateway
+Gateway: stunner/udp-gateway (loglevel: "all:INFO")
+Authentication type: static, username/password: user-1/pass-1
 ...
 ```
 
@@ -459,24 +456,23 @@ credentials on the client side for potentially nefarious purposes. Note that att
 be able to make too much harm with these credentials, since the only Kubernetes service they can
 reach via STUNner is the Kurento media server pool. This is why we have installed the UDPRoute:
 STUNner will allow clients to connect *only* to the backend service(s) of the UDPRoute, and nothing
-else. Then, the attackers would need access to the application-server to open WebRTC endpoints on
-the media server for their own purposes, but application servers should be secure by default no?
+else. Then, attackers would need access to the application-server to open WebRTC endpoints on the
+media server for their own purposes, but media servers should be secure by default no?
 
 In other words, *STUNner's default security model is exactly the same as if we put the application
 servers and media servers on public-facing physical servers*.
 
 Still, it would be nice to use per-session passwords. STUNner allows you to do that, by changing
-the authentication type to `ephemeral` (the legacy alias is `longterm`, but this is deprecated)
-instead of `static`. Even better: STUNner's ephemeral TURN credentials are valid only for a
-specified time (one day by default, but you can override this querying the [authentication
-service](https://github.com/l7mp/stunner-auth-service)), after which they expire and attackers can
-no longer reuse them. And to make things even better we don't even have to work too much to switch
-STUNner to the `ephemeral` authentication mode: it is enough to update the GatewayConfig and
-everything should happen from this point automagically.
+the authentication type to `ephemeral` instead of `static`. Even better: STUNner's ephemeral TURN
+credentials are valid only for a specified time (one day by default, but you can override this via
+the [authentication service](https://github.com/l7mp/stunner-auth-service)), after which they
+expire and attackers can no longer reuse them. To make things even better, we don't even have to
+work too much to switch STUNner to the `ephemeral` authentication mode: it is enough to update the
+GatewayConfig and everything should happen from this point automagically.
 
 ```console
 kubectl apply -f - <<EOF
-apiVersion: stunner.l7mp.io/v1alpha1
+apiVersion: stunner.l7mp.io/v1
 kind: GatewayConfig
 metadata:
   name: stunner-gatewayconfig
@@ -498,15 +494,15 @@ this goes without having to restart the server.
 Check that the running config indeed is updated correctly.
 
 ```console
-cmd/stunnerctl/stunnerctl running-config stunner/stunnerd-config
-STUN/TURN authentication type:  longterm
-STUN/TURN secret:               my-very-secure-secret
-Listener 1
-        Name:   udp-listener
-        Listener:       udp-listener
-        Protocol:       UDP
-        Public address: 34.118.18.210
-        Public port:    3478
+stunnerctl -n stunner config udp-gateway
+Gateway: stunner/udp-gateway (loglevel: "all:INFO")
+Authentication type: ephemeral, shared-secret: my-very-secure-secret
+Listeners:
+  - Name: stunner/udp-gateway/udp-listener
+    Protocol: TURN-UDP
+    Public address:port: 34.118.88.91:3478
+    Routes: [stunner/iperf-server]
+    Endpoints: [10.76.1.4, 10.80.4.47]
 ```
 
 Reload the browser client and re-register: you should see an updated ICE configuration with the
@@ -516,9 +512,9 @@ new, per-session STUN/TURN credentials.
 {
   "iceServers": [
     {
-      "url": "turn:34.118.18.210:3478?transport=UDP",
-      "username": "1659124224",
-      "credential": "EetxP554IRvTeHIm433GPMq+7Rw="
+      "urls": ["turn:34.118.112.176:3478?transport=udp"],
+      "username": "1704390545:user",
+      "credential": "br34ws29f1XAQqvMOthRHu0IglM="
     }
   ],
   "iceTransportPolicy": "relay"
@@ -526,7 +522,8 @@ new, per-session STUN/TURN credentials.
 ```
 
 Ephemeral credentials expire in one day, after which they are either refreshed (e.g., by forcing
-the users to re-register) or become useless.
+the users to re-register) or become useless. See more on this in the STUNner [authentication
+guide](/doc/AUTH.md).
 
 ## Clean up
 

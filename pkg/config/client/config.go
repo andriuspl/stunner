@@ -1,45 +1,51 @@
-package configdiscoveryclient
+package client
 
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"regexp"
 	"strconv"
 
+	stnrv1 "github.com/l7mp/stunner/pkg/apis/v1"
+	stnrv1a1 "github.com/l7mp/stunner/pkg/apis/v1alpha1"
 	"sigs.k8s.io/yaml"
-
-	"github.com/l7mp/stunner/pkg/apis/v1alpha1"
 )
 
-// ZeroConfig builds a zero configuration useful for bootstrapping STUNner. It starts with
-// plaintext authentication and opens no listeners and clusters.
-func ZeroConfig(id string) *v1alpha1.StunnerConfig {
-	return &v1alpha1.StunnerConfig{
-		ApiVersion: v1alpha1.ApiVersion,
-		Admin:      v1alpha1.AdminConfig{Name: id},
-		Auth: v1alpha1.AuthConfig{
-			Type:  "plaintext",
-			Realm: v1alpha1.DefaultRealm,
+type ConfigSkeleton struct {
+	ApiVersion string `json:"version"`
+}
+
+// ZeroConfig builds a zero configuration useful for bootstrapping STUNner. The minimal config
+// defaults to static authentication with a dummy username and password and opens no listeners or
+// clusters.
+func ZeroConfig(id string) *stnrv1.StunnerConfig {
+	return &stnrv1.StunnerConfig{
+		ApiVersion: stnrv1.ApiVersion,
+		Admin:      stnrv1.AdminConfig{Name: id},
+		Auth: stnrv1.AuthConfig{
+			Type:  "static",
+			Realm: stnrv1.DefaultRealm,
 			Credentials: map[string]string{
 				"username": "dummy-username",
 				"password": "dummy-password",
 			},
 		},
-		Listeners: []v1alpha1.ListenerConfig{},
-		Clusters:  []v1alpha1.ClusterConfig{},
+		Listeners: []stnrv1.ListenerConfig{},
+		Clusters:  []stnrv1.ClusterConfig{},
 	}
 }
 
 // ParseConfig parses a raw buffer holding a configuration, substituting environment variables for
 // placeholders in the configuration. Returns the new configuration or error if parsing fails.
-func ParseConfig(c []byte) (*v1alpha1.StunnerConfig, error) {
+func ParseConfig(c []byte) (*stnrv1.StunnerConfig, error) {
 	// substitute environtment variables
 	// default port: STUNNER_PUBLIC_PORT -> STUNNER_PORT
 	re := regexp.MustCompile(`^[0-9]+$`)
 	port, ok := os.LookupEnv("STUNNER_PORT")
 	if !ok || port == "" || !re.Match([]byte(port)) {
-		publicPort := v1alpha1.DefaultPort
+		publicPort := stnrv1.DefaultPort
 		publicPortStr, ok := os.LookupEnv("STUNNER_PUBLIC_PORT")
 		if ok {
 			if p, err := strconv.Atoi(publicPortStr); err == nil {
@@ -49,18 +55,86 @@ func ParseConfig(c []byte) (*v1alpha1.StunnerConfig, error) {
 		os.Setenv("STUNNER_PORT", fmt.Sprintf("%d", publicPort))
 	}
 
-	e := os.ExpandEnv(string(c))
+	// make sure credentials are not affected by environment substitution
 
-	s := v1alpha1.StunnerConfig{}
-	// try YAML first
-	if err := yaml.Unmarshal([]byte(e), &s); err != nil {
-		// if it fails, try to json
-		if errJ := json.Unmarshal([]byte(e), &s); err != nil {
-			return nil, fmt.Errorf("could not parse config file: "+
+	// parse up before env substitution is applied
+	confRaw, err := parseRaw(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// save credentials
+	credRaw := make(map[string]string)
+	maps.Copy(credRaw, confRaw.Auth.Credentials)
+
+	// apply env substitution and parse again
+	e := os.ExpandEnv(string(c))
+	confExp, err := parseRaw([]byte(e))
+	if err != nil {
+		return nil, err
+	}
+
+	// restore credentials
+	maps.Copy(confExp.Auth.Credentials, credRaw)
+
+	return confExp, nil
+}
+
+func parseRaw(c []byte) (*stnrv1.StunnerConfig, error) {
+	// try to parse only the config version first
+	k := ConfigSkeleton{}
+	if err := yaml.Unmarshal([]byte(c), &k); err != nil {
+		if errJ := json.Unmarshal([]byte(c), &k); err != nil {
+			return nil, fmt.Errorf("could not parse config file API version: "+
 				"YAML parse error: %s, JSON parse error: %s\n",
 				err.Error(), errJ.Error())
 		}
 	}
 
+	s := stnrv1.StunnerConfig{}
+
+	switch k.ApiVersion {
+	case stnrv1.ApiVersion:
+		if err := yaml.Unmarshal([]byte(c), &s); err != nil {
+			if errJ := json.Unmarshal([]byte(c), &s); errJ != nil {
+				return nil, fmt.Errorf("could not parse config file: "+
+					"YAML parse error: %s, JSON parse error: %s\n",
+					err.Error(), errJ.Error())
+			}
+		}
+	case stnrv1a1.ApiVersion:
+		a := stnrv1a1.StunnerConfig{}
+		if err := yaml.Unmarshal([]byte(c), &a); err != nil {
+			if errJ := json.Unmarshal([]byte(c), &a); errJ != nil {
+				return nil, fmt.Errorf("could not parse config file: "+
+					"YAML parse error: %s, JSON parse error: %s\n",
+					err.Error(), errJ.Error())
+			}
+		}
+
+		sv1, err := stnrv1a1.ConvertToV1(&a)
+		if err != nil {
+			return nil, fmt.Errorf("could not convert config to API V1: %s", err)
+		}
+
+		sv1.DeepCopyInto(&s)
+	}
+
 	return &s, nil
+}
+
+// IsConfigDeleted is a helper that allows to decide whether a config is being deleted. When a
+// config is being removed (say, because the corresponding Gateway is deleted), the CDS server
+// sends a validated zero-config for the client. This function is a quick helper to decide whether
+// the config received is such a zero-config.
+func IsConfigDeleted(conf *stnrv1.StunnerConfig) bool {
+	if conf == nil {
+		return false
+	}
+	zeroConf := ZeroConfig(conf.Admin.Name)
+	// zeroconfs have to be explcitly validated before deepEq (the cds client validates)
+	if err := zeroConf.Validate(); err != nil {
+		return false
+	}
+	return conf.DeepEqual(zeroConf)
 }

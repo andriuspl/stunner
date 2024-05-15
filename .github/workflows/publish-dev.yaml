@@ -54,3 +54,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           client_payload: '{"tag": "dev", "type": "stunner"}'
           workflow_file_name: publish.yaml
+
+  push_chart:
+    name: Push helm charts to the repo
+    needs: push_to_registry
+    uses: l7mp/stunner/.github/workflows/publish--push-charts.yml@main
+    with:
+      dev: true
+    secrets: inherit

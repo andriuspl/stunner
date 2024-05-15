@@ -27,7 +27,6 @@ Install the STUNner gateway operator and STUNner ([more info](https://github.com
 helm repo add stunner https://l7mp.io/stunner
 helm repo update
 helm install stunner-gateway-operator stunner/stunner-gateway-operator --create-namespace --namespace=stunner-system
-helm install stunner stunner/stunner
 ```
 
 Configure STUNner to act as a STUN server towards clients, and to let media reach the media server.
@@ -37,9 +36,6 @@ git clone https://github.com/l7mp/stunner
 cd stunner/docs/examples/neko
 kubectl apply -f stunner.yaml
 ```
-
-> **Warning**
-> In case of [managed mode](/docs/INSTALL.md), update the `neko-plane` UDPRoute by replacing `stunner` in backendRefs with the generated deployment, e.g., `udp-gateway`.
 
 This will expose STUNner on a public IP on UDP port 3478. A Kubernetes `LoadBalancer` assigns an
 ephemeral public IP address to the service, so first we need to learn the external IP.
@@ -55,19 +51,22 @@ STUNNERIP=$(kubectl get service udp-gateway -n default -o jsonpath='{.status.loa
 We need to give this public IP the Neko configuration in the `NEKO_ICESERVERS` environment variable, inside the `json` content (basically this will tell you browser to use STUNner as a STUN/TURN server).
 You can do that by hand, or by this fancy `sed` command:
 ```console
-sed -i "s/1.1.1.1/$STUNNERIP/g" neko.yaml
+sed -i "s/turn:[\.0-9]*:3478/turn:$STUNNERIP:3478/g" neko.yaml
 ```
 
-Now apply the Neko manifests:
+Now apply the Neko manifests and wait for the `neko` deployment to be available (should take a couple of seconds):
 ```console
 kubectl apply -f neko.yaml
-kubectl get pods
+kubectl wait --for=condition=Available deployment neko --timeout 5m
 ```
 
 In this setup we use `ingress` to expose the Neko UI. Feel free to customize the `ingress` resource to your setup.
 If you don't have an ingress controller, you can use the `neko-tcp` service with a `LoadBalancer` type.
 
 Ideally, by opening your ingress controller in your browser, you should see the Neko UI. You can log in with the `admin`:`admin` credentials. The WebRTC stream then should be relayed through STUNner.
+
+> [!NOTE]
+> Tested with Chromium/Google Chrome.
 
 ## Help
 
